@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pydantic
+qdrant-client
+sentence-transformers
+networkx
+requests
+pytest

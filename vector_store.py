@@ -1,48 +1,75 @@
+"""Embeds the policy file, stores it in Qdrant, and runs role-filtered searches."""
+import hashlib
+from pathlib import Path
+
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
+from qdrant_client.models import Distance, FieldCondition, Filter, MatchAny, PointStruct, VectorParams
 from sentence_transformers import SentenceTransformer
+
 from chunker import load_and_chunk
 
-# 1. Load an embedding model (converts text -> list of 384 numbers)
-print("Loading Embedding Model...")
-encoder = SentenceTransformer("all-MiniLM-L6-v2")
+POLICY_FILE = Path(__file__).resolve().parent / "company_policy.txt"
+COLLECTION = "company_knowledge"
+EMBED_DIM = 384  # output size of all-MiniLM-L6-v2
 
-# 2. Initialize in-memory Qdrant database (no cloud setup needed!)
+# Which chunk labels each role may read. A role missing from this table
+# gets nothing: the code fails closed instead of open.
+ROLE_ACCESS = {
+    "employee": ["employee"],
+    "hr_admin": ["employee", "hr_admin"],
+}
+
+# Starting value only. Run eval_retrieval.py and adjust it: it must sit above the
+# scores of unrelated questions and below the scores of real ones.
+MIN_SCORE = 0.30
+
+encoder = SentenceTransformer("all-MiniLM-L6-v2")
 client = QdrantClient(":memory:")
 
-# 3. Create a collection (like a database table for vectors)
-collection_name = "company_knowledge"
-client.create_collection(
-    collection_name=collection_name,
-    vectors_config=VectorParams(size=384, distance=Distance.COSINE),
-)
+# Changes whenever the policy file changes. The cache stores it with every answer,
+# so answers computed from an older version of the policy are never reused.
+CORPUS_VERSION = hashlib.sha256(POLICY_FILE.read_bytes()).hexdigest()[:8]
 
-# 4. Chunk document & insert into Qdrant
-chunks = load_and_chunk("company_policy.txt")
-points = []
-
-for idx, text in enumerate(chunks):
-    vector = encoder.encode(text).tolist()
-    points.append(PointStruct(id=idx, vector=vector, payload={"text": text}))
-
-client.upsert(collection_name=collection_name, points=points)
-print(f"--- Successfully indexed {len(points)} chunks into Qdrant! ---")
+_indexed = False
 
 
-def search(query: str, top_k: int = 1):
-    """Finds the chunk that best answers the query."""
-    query_vector = encoder.encode(query).tolist()
-    results = client.query_points(
-        collection_name=collection_name,
-        query=query_vector,
-        limit=top_k
+def ensure_index():
+    """Build the index once, the first time it is needed (not at import time)."""
+    global _indexed
+    if _indexed:
+        return
+    chunks = load_and_chunk(POLICY_FILE)
+    client.create_collection(
+        collection_name=COLLECTION,
+        vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
     )
-    
-    print(f"\nUser Question: '{query}'")
-    for res in results.points:
-        print(f"Matching Chunk (Score: {res.score:.2f}):\n-> {res.payload['text']}")
-    
-    return results.points[0].payload['text'] if results.points else None
+    vectors = encoder.encode([chunk["text"] for chunk in chunks])
+    points = [
+        PointStruct(id=i, vector=vector.tolist(), payload=chunk)
+        for i, (chunk, vector) in enumerate(zip(chunks, vectors))
+    ]
+    client.upsert(collection_name=COLLECTION, points=points)
+    _indexed = True
 
-if __name__ == "__main__":
-    search("How much money can I get back for internet?")
+
+def search(query, role, top_k=1, min_score=MIN_SCORE):
+    """Return the best chunks this role is allowed to see, as a list of dicts.
+
+    The role filter runs INSIDE the vector search (pre-filtering), so a forbidden
+    chunk is never retrieved, never scored, and never reaches the LLM.
+    """
+    if role not in ROLE_ACCESS:
+        raise ValueError(f"Unknown role: {role!r}")
+    ensure_index()
+    allowed = Filter(must=[FieldCondition(key="role_required", match=MatchAny(any=ROLE_ACCESS[role]))])
+    result = client.query_points(
+        collection_name=COLLECTION,
+        query=encoder.encode(query).tolist(),
+        query_filter=allowed,
+        limit=top_k,
+        score_threshold=min_score,  # None means no cutoff
+    )
+    return [
+        {"id": p.id, "score": p.score, "text": p.payload["text"], "role_required": p.payload["role_required"]}
+        for p in result.points
+    ]

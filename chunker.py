@@ -1,15 +1,28 @@
-def load_and_chunk(file_path: str, chunk_size: int = 150):
-    with open(file_path, "r") as f:
-        text = f.read()
-    
-    # Split the document into paragraphs based on double line breaks
-    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-    
-    print(f"--- Loaded {len(paragraphs)} Chunks from {file_path} ---")
-    for idx, chunk in enumerate(paragraphs):
-        print(f"\nChunk {idx + 1}:\n{chunk}")
-    
-    return paragraphs
+"""Splits company_policy.txt into chunks and tags each chunk with who may read it."""
+import re
+from pathlib import Path
+
+# A chunk that contains this word is restricted to hr_admin users.
+# Keep each policy section in ONE paragraph (no blank line inside a section),
+# otherwise the second half of a confidential section would not carry the marker.
+CONFIDENTIAL_MARKER = "CONFIDENTIAL"
+
+
+def load_and_chunk(file_path):
+    """Return a list of {"text": ..., "role_required": ...}, one dict per paragraph."""
+    text = Path(file_path).read_text(encoding="utf-8")
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    chunks = []
+    for paragraph in paragraphs:
+        restricted = CONFIDENTIAL_MARKER in paragraph.upper()
+        chunks.append({
+            "text": paragraph,
+            "role_required": "hr_admin" if restricted else "employee",
+        })
+    return chunks
+
 
 if __name__ == "__main__":
-    load_and_chunk("company_policy.txt")
+    policy = Path(__file__).resolve().parent / "company_policy.txt"
+    for i, chunk in enumerate(load_and_chunk(policy), start=1):
+        print(f"\nChunk {i} [{chunk['role_required']}]:\n{chunk['text']}")

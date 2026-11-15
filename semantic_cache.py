@@ -1,89 +1,99 @@
-import time
-from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
-from sentence_transformers import SentenceTransformer
+"""A role-aware semantic cache: reuse an earlier answer when a new question means the same thing."""
+import re
+import uuid
 
-# 1. Initialize Model & Cache Vector Store
-encoder = SentenceTransformer("all-MiniLM-L6-v2")
-cache_client = QdrantClient(":memory:")
-cache_collection = "semantic_cache"
+from qdrant_client.models import Distance, FieldCondition, Filter, MatchValue, PointStruct, VectorParams
 
-cache_client.create_collection(
-    collection_name=cache_collection,
-    vectors_config=VectorParams(size=384, distance=Distance.COSINE),
-)
+from vector_store import CORPUS_VERSION, EMBED_DIM, ROLE_ACCESS, client, encoder
 
-SIMILARITY_THRESHOLD = 0.75
-cache_id_counter = 0
+CACHE_COLLECTION = "semantic_cache"
+
+# Chosen from tune_cache_threshold.py on 12 question pairs: the best paraphrase similarities
+# were 0.88, 0.79, 0.77, and the highest near-miss (ignoring the number check below) was 0.69.
+# 0.75 sits above that with a margin. Raising it means fewer hits, lowering it risks wrong answers.
+CACHE_THRESHOLD = 0.75
+
+_NUMBER = re.compile(r"\d+(?:[.,]\d+)?")
 
 
-def get_from_cache(query: str):
-    """Checks if a semantically similar question was already asked."""
-    query_vector = encoder.encode(query).tolist()
-    
-    results = cache_client.query_points(
-        collection_name=cache_collection,
-        query=query_vector,
-        limit=1
+def numbers_match(a, b):
+    """True if both questions contain the same numbers.
+
+    Embedding similarity barely notices numbers: "$50" vs "$500" scored 0.92 in testing,
+    higher than every genuine paraphrase. Without this check the cache could answer a
+    question about $500 with the stored answer for $50.
+    """
+    return set(_NUMBER.findall(a)) == set(_NUMBER.findall(b))
+
+
+def _create_collection():
+    client.create_collection(
+        collection_name=CACHE_COLLECTION,
+        vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
     )
-    
-    if results.points and results.points[0].score >= SIMILARITY_THRESHOLD:
-        match = results.points[0]
-        return {
-            "cached_answer": match.payload["answer"],
-            "matched_question": match.payload["question"],
-            "score": match.score
-        }
+
+
+_create_collection()
+
+
+def clear_cache():
+    client.delete_collection(CACHE_COLLECTION)
+    _create_collection()
+
+
+def _cache_filter(role):
+    """An entry is usable only if it was made for THIS role and THIS version of the policy."""
+    return Filter(must=[
+        FieldCondition(key="role", match=MatchValue(value=role)),
+        FieldCondition(key="corpus_version", match=MatchValue(value=CORPUS_VERSION)),
+    ])
+
+
+def get_from_cache(question, role):
+    results = client.query_points(
+        collection_name=CACHE_COLLECTION,
+        query=encoder.encode(question.strip()).tolist(),
+        query_filter=_cache_filter(role),
+        limit=5,
+        score_threshold=CACHE_THRESHOLD,
+    )
+    for match in results.points:  # best match first; take the first one whose numbers agree
+        if numbers_match(question, match.payload["question"]):
+            return {
+                "answer": match.payload["answer"],
+                "sources": match.payload["sources"],
+                "matched_question": match.payload["question"],
+                "score": round(match.score, 3),
+            }
     return None
 
 
-def save_to_cache(query: str, answer: str):
-    """Stores a new question and its generated answer in the cache."""
-    global cache_id_counter
-    query_vector = encoder.encode(query).tolist()
-    
-    cache_client.upsert(
-        collection_name=cache_collection,
-        points=[
-            PointStruct(
-                id=cache_id_counter,
-                vector=query_vector,
-                payload={"question": query, "answer": answer}
-            )
-        ]
+def save_to_cache(question, answer, sources, role):
+    client.upsert(
+        collection_name=CACHE_COLLECTION,
+        points=[PointStruct(
+            id=str(uuid.uuid4()),
+            vector=encoder.encode(question.strip()).tolist(),
+            payload={
+                "question": question, "answer": answer, "sources": sources,
+                "role": role, "corpus_version": CORPUS_VERSION,
+            },
+        )],
     )
-    cache_id_counter += 1
 
 
-def query_with_cache(user_query: str):
-    start_time = time.time()
-    
-    # Check Semantic Cache First
-    cached_result = get_from_cache(user_query)
-    
-    if cached_result:
-        latency = (time.time() - start_time) * 1000
-        print(f"\n⚡ [CACHE HIT - {latency:.2f}ms]")
-        print(f"Query: '{user_query}'")
-        print(f"Matched Previous Query: '{cached_result['matched_question']}' (Similarity: {cached_result['score']:.2f})")
-        print(f"Answer: {cached_result['cached_answer']}")
-    else:
-        # Simulate slower primary database search / LLM call
-        time.sleep(0.5)  # Simulates 500ms delay for actual retrieval
-        generated_answer = "Employees can claim up to $50 per month for home internet expenses."
-        
-        # Save to cache for future users
-        save_to_cache(user_query, generated_answer)
-        
-        latency = (time.time() - start_time) * 1000
-        print(f"\n🐢 [CACHE MISS - {latency:.2f}ms]")
-        print(f"Query: '{user_query}'")
-        print(f"Answer: {generated_answer}")
+def cached_answer(question, role, generate_fn):
+    """Return the cached answer if one is close enough, otherwise call generate_fn and cache it.
 
-
-if __name__ == "__main__":
-    # Query 1: First time asking (Cache Miss -> DB search)
-    query_with_cache("How much can I claim for home internet?")
-    
-    # Query 2: Rephrased question asking the exact same thing (Cache Hit!)
-    query_with_cache("What is the internet reimbursement limit?")
+    Only real, successful answers are cached: not "nothing found" and not
+    fallback text produced when no LLM is configured.
+    """
+    if role not in ROLE_ACCESS:
+        raise ValueError(f"Unknown role: {role!r}")
+    hit = get_from_cache(question, role)
+    if hit:
+        return {**hit, "found": True, "generated": True, "cache": "HIT"}
+    result = generate_fn(question, role)
+    if result["found"] and result["generated"]:
+        save_to_cache(question, result["answer"], result["sources"], role)
+    return {**result, "cache": "MISS"}
